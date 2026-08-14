@@ -36,8 +36,21 @@
           is empty.
     A0  - Button 1 (increase capacity), INPUT_PULLUP
     A1  - Button 2 (decrease capacity), INPUT_PULLUP
+    A2  - Security arm/disarm button, INPUT_PULLUP
+          Press once to ARM (treat any entry as unusual-time/
+          unauthorized), press again to DISARM. No real-time clock
+          is used - this is a manual "away mode" toggle instead,
+          same principle as a home security system's arm/disarm.
     A4  - I2C SDA (MPU-6050 + OLED, shared bus)
     A5  - I2C SCL (MPU-6050 + OLED, shared bus)
+    D13 - Passive buzzer, direct-driven:
+          D13 -> Buzzer (+), Buzzer (-) -> GND
+          Sounds a sharp 3-beep alert pattern (3500Hz, 200ms on/120ms
+          off) each time someone tries to enter while the room is
+          already at capacity.
+          Sounds a distinct, longer 6-beep pattern (3000Hz, 150ms
+          on/100ms off) when an entry is detected while the security
+          mode is ARMED - a possible unauthorized/unusual-time entry.
 
   Required libraries (install via Library Manager):
     - Adafruit GFX Library
@@ -69,8 +82,11 @@
 
 #define BTN_INC A0
 #define BTN_DEC A1
+#define SECURITY_BTN A3   // arm/disarm security mode - press once to toggle
 
 #define ACTIVITY_LED 12   // direct-driven LED: ON on tap/motion, OFF when calm
+
+#define PASSIVE_BUZZER A2   // D13 - passive buzzer, alarm when entry blocked at capacity
 
 // ---------------- MPU-6050 raw I2C setup ----------------
 #define MPU_ADDR        0x68  // AD0 tied to GND -> 0x68
@@ -113,13 +129,38 @@ const float VIBRATION_THRESHOLD_G = 0.3;
 float mpuRestBaselineG = 1.0; // overwritten by calibrateMpuBaseline() in setup()
 unsigned long lastVibrationShown = 0;
 
-// Activity LED (D12, via transistor) - stays ON for a short hold time
-// after a tap/vibration or close approach, so it reads as a clean
-// on/off state rather than flickering for an instant.
+// Activity LED (D12, direct-driven, no transistor) - stays ON for a
+// short hold time after a tap/vibration or close approach while the
+// room is empty, so it reads as a clean on/off state rather than
+// flickering for an instant.
 const int PROXIMITY_ACTIVITY_CM = 30;      // "someone near the sensor" distance
 const unsigned long ACTIVITY_HOLD_MS = 1500; // how long the LED stays on after activity
 unsigned long activityLedOffTime = 0;
 bool activityLedOn = false;
+
+// Capacity alarm (passive buzzer, D13) - short 3-beep alert pattern
+// each time someone tries to enter while the room is already at capacity.
+const unsigned int ALARM_FREQ_HZ = 3500;       // sharper, more attention-grabbing pitch
+const unsigned long ALARM_BEEP_ON_MS = 200;    // each beep's duration
+const unsigned long ALARM_BEEP_OFF_MS = 120;   // silent gap between beeps
+const int ALARM_BEEP_COUNT = 3;                // number of beeps per alert
+
+// Security arm/disarm mode - since the Arduino has no real-time clock,
+// "unusual time" is defined by the user arming the system before an
+// off-hours period (e.g. leaving for the night), rather than a fixed
+// clock window. Any entry detected while armed is treated as a
+// potential unauthorized/unusual-time entry.
+bool securityArmed = false;
+bool lastSecurityBtnState = HIGH;
+unsigned long lastSecurityToggle = 0;
+const unsigned long SECURITY_DEBOUNCE_MS = 300;
+
+// Security alarm uses a longer, more urgent pattern than the capacity
+// alarm so the two are distinguishable by ear.
+const unsigned int SECURITY_ALARM_FREQ_HZ = 3000;
+const unsigned long SECURITY_BEEP_ON_MS = 150;
+const unsigned long SECURITY_BEEP_OFF_MS = 100;
+const int SECURITY_BEEP_COUNT = 6;
 
 // ---------------- Function prototypes ----------------
 long getDistanceCM(int trigPin, int echoPin);
@@ -133,6 +174,9 @@ bool mpuReadAccelG(float &magG);
 void calibrateMpuBaseline();
 void triggerActivityLed();
 void updateActivityLed();
+void soundCapacityAlarm();
+void soundSecurityAlarm();
+void handleSecurityButton();
 
 void setup() {
   Serial.begin(9600);
@@ -153,6 +197,11 @@ void setup() {
 
   pinMode(ACTIVITY_LED, OUTPUT);
   digitalWrite(ACTIVITY_LED, LOW); // starts OFF - calm/quiet
+
+  pinMode(PASSIVE_BUZZER, OUTPUT);
+  noTone(PASSIVE_BUZZER); // ensure silent at boot
+
+  pinMode(SECURITY_BTN, INPUT_PULLUP);
 
   Wire.begin();
 
@@ -180,6 +229,7 @@ void setup() {
 
 void loop() {
   handleButtons();
+  handleSecurityButton();
   handleUltrasonics();
   updateLEDs();
 
@@ -254,8 +304,13 @@ void handleUltrasonics() {
       if (peopleCount < capacityLimit) {
         peopleCount++;
         Serial.println(F("ENTRY detected"));
+        if (securityArmed) {
+          Serial.println(F("SECURITY ALERT: entry detected while armed (unusual time)"));
+          soundSecurityAlarm();
+        }
       } else {
         Serial.println(F("ENTRY blocked - at capacity"));
+        soundCapacityAlarm();
       }
       sensor1Armed = true;
     }
@@ -281,6 +336,22 @@ void handleButtons() {
     Serial.println(capacityLimit);
     if (peopleCount > capacityLimit) peopleCount = capacityLimit;
   }
+}
+
+// ---------------- Security Arm/Disarm Button (A2) ----------------
+// Single press toggles armed/disarmed. Press once before leaving an
+// area unoccupied ("arming" it), press again when returning.
+void handleSecurityButton() {
+  bool state = digitalRead(SECURITY_BTN);
+  unsigned long now = millis();
+
+  if (state == LOW && lastSecurityBtnState == HIGH && (now - lastSecurityToggle) > SECURITY_DEBOUNCE_MS) {
+    securityArmed = !securityArmed;
+    lastSecurityToggle = now;
+    Serial.print(F("Security mode: "));
+    Serial.println(securityArmed ? F("ARMED") : F("DISARMED"));
+  }
+  lastSecurityBtnState = state;
 }
 
 // ---------------- Mood LEDs ----------------
@@ -338,6 +409,40 @@ void updateActivityLed() {
   if (activityLedOn && millis() > activityLedOffTime) {
     digitalWrite(ACTIVITY_LED, LOW);
     activityLedOn = false;
+  }
+}
+
+// ---------------- Capacity Alarm (D13, passive buzzer) ----------------
+// Plays a short pattern of ALARM_BEEP_COUNT beeps (default 3) instead of
+// one continuous tone - more attention-grabbing and reads clearly as an
+// "alert" rather than a generic single chirp.
+// NOTE: this uses delay() internally, so the loop() pauses for the
+// duration of the whole pattern (~950ms at default settings) while it
+// plays. That's intentional and brief enough not to affect sensor
+// responsiveness in any noticeable way, but keep it in mind if you
+// later want a fully non-blocking version.
+void soundCapacityAlarm() {
+  for (int i = 0; i < ALARM_BEEP_COUNT; i++) {
+    tone(PASSIVE_BUZZER, ALARM_FREQ_HZ, ALARM_BEEP_ON_MS);
+    delay(ALARM_BEEP_ON_MS);
+    noTone(PASSIVE_BUZZER);
+    if (i < ALARM_BEEP_COUNT - 1) {
+      delay(ALARM_BEEP_OFF_MS);
+    }
+  }
+}
+
+// Distinct, longer pattern (6 quick beeps vs. capacity alarm's 3) so
+// the two alert types are recognizable by ear without looking at the
+// OLED or phone.
+void soundSecurityAlarm() {
+  for (int i = 0; i < SECURITY_BEEP_COUNT; i++) {
+    tone(PASSIVE_BUZZER, SECURITY_ALARM_FREQ_HZ, SECURITY_BEEP_ON_MS);
+    delay(SECURITY_BEEP_ON_MS);
+    noTone(PASSIVE_BUZZER);
+    if (i < SECURITY_BEEP_COUNT - 1) {
+      delay(SECURITY_BEEP_OFF_MS);
+    }
   }
 }
 
@@ -424,7 +529,8 @@ void updateDisplay(float vibeMag, bool vibrationDetected, bool mpuOk) {
   display.print(F("Count: "));
   display.print(peopleCount);
   display.print(F(" / "));
-  display.println(capacityLimit);
+  display.print(capacityLimit);
+  display.println(securityArmed ? F("  [ARMED]") : F(""));
 
   display.setCursor(0, 32);
   if (peopleCount == 0) display.println(F("Status: CALM"));
@@ -462,5 +568,7 @@ void sendBluetoothStatus() {
   btSerial.print(F("COUNT:"));
   btSerial.print(peopleCount);
   btSerial.print(F("/"));
-  btSerial.println(capacityLimit);
+  btSerial.print(capacityLimit);
+  btSerial.print(F(",ARMED:"));
+  btSerial.println(securityArmed ? 1 : 0);
 }
